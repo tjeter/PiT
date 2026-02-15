@@ -3,6 +3,7 @@ import numpy as np
 import logging
 import os
 import random
+from scipy.stats import entropy
 
 
 # Set up logging
@@ -147,6 +148,85 @@ def kl_loss(p, q):
 
     return kl
 
+# Adding for future loss ablation experiments
+def wasserstein_distance(u, v, p=1):
+    """
+    Calculates the Wasserstein distance of order p for 1D samples.
+
+    This function works by sorting the samples and approximating the integral
+    between the inverse CDFs. It assumes equal weights (empirical distribution).
+    For unequal lengths, it uses linear interpolation.
+
+    Args:
+        u: A 1D numpy array of samples.
+        v: A 1D numpy array of samples.
+        p: The order of the Wasserstein distance (default is 1).
+
+    Returns:
+        Computed Wasserstein distance (float).
+    """
+    u = np.sort(u)
+    v = np.sort(v)
+
+    if len(u) != len(v):
+        # Interpolate the smaller array to match the size of the larger one
+        if len(u) > len(v):
+            u, v = v, u # Ensure u is the smaller array
+        us = np.linspace(0, 1, len(u), endpoint=False) + 1/(2*len(u))
+        vs = np.linspace(0, 1, len(v), endpoint=False) + 1/(2*len(v))
+        u = np.interp(vs, us, u) # Use np.interp instead of deprecated np.linalg.interp
+
+    # Compute the mean of the absolute difference raised to the power p, then take the p-th root
+    distance = np.mean(np.abs(u - v)**p)**(1/p)
+    return distance
+
+def jensen_shannon_divergence(p, q, base=None):
+    """
+    Calculates the Jensen-Shannon divergence between two probability distributions.
+
+    Args:
+        p (array-like): The first probability distribution.
+        q (array-like): The second probability distribution.
+        base (float, optional): The base of the logarithm used in the entropy 
+                                calculation. Defaults to None, which uses the 
+                                default base of scipy.stats.entropy (natural logarithm).
+
+    Returns:
+        float: The Jensen-Shannon divergence.
+    """
+    # Convert to numpy arrays and ensure they are normalized to sum to 1
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+    p /= p.sum()
+    q /= q.sum()
+
+    m = (p + q) / 2.0
+    jsd = 0.5 * (entropy(p, m, base=base) + entropy(q, m, base=base))
+    return jsd
+
+# Square root of the JSD is the Jensen-Shannon distance
+def jensen_shannon_distance(jsd):
+    jd = np.sqrt(jsd)
+    return jd
+
+def mean_squared_error(p, q): # y_true, y_pred
+    """
+    Calculates the Mean Squared Error (MSE) between two values.
+
+    Args:
+        p (list or np.array): The actual/observed values.
+        q (list or np.array): The predicted values.
+
+    Returns:
+        float: The mean squared error.
+    """
+    # Convert inputs to numpy arrays for vectorized operations
+    p = np.array(p)
+    q = np.array(q)
+    
+    # Calculate the squared differences, then the mean
+    mse = np.mean(np.square(p - q))
+    return mse
 
 def adjust_learning_rate(optimiser, epoch, lr_):
     lr_adjust = {epoch: lr_ * (0.5 ** ((epoch - 1) // 1))}
