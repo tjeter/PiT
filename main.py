@@ -105,11 +105,15 @@ class AnomalyDetection:
             n_heads =self.n_heads
         )
 
-        for m in self.model.modules():
-            if isinstance(m, (nn.Linear, nn.Conv1d)):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        ''' Fixed this initialization inside the model so no need to overwrite.
+            Values are now carefully chosen initializations in attention.
+            Keeping this will silently degrade convergence.
+        '''
+        # for m in self.model.modules():
+        #     if isinstance(m, (nn.Linear, nn.Conv1d)):
+        #         nn.init.xavier_uniform_(m.weight)
+        #         if m.bias is not None:
+        #             nn.init.zeros_(m.bias)
 
         self.optimiser = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.model.to(self.device)
@@ -126,8 +130,9 @@ class AnomalyDetection:
 
     def validation(self, valid_loader):
         self.model.eval()
-        loss_1 = []
-        loss_2 = []
+        # loss_1 = []
+        # loss_2 = []
+        losses = []
         for i, (input_data, _) in enumerate(valid_loader):
             input = input_data.float().to(self.device)
 
@@ -136,38 +141,55 @@ class AnomalyDetection:
                 series,
                 prior,
                 _,
-                hurst,
-                tau,
+                # hurst,
+                _,
+                # tau,
+                _,
                 smoothness_loss,
                 beta_prior_loss,
                 tau_smoothness_loss,
             ) = self.model(input)
+            # Reconstruction loss
+            rec_loss = self.criterion(output, input)
+            
             series_loss = 0.0
             prior_loss = 0.0
             for u in range(len(prior)):
-                norm_prior = torch.unsqueeze(
-                    torch.sum(prior[u], dim=-1), dim=-1
-                ).repeat(1, 1, 1, self.win_size)
+                series_loss += kl_loss(series[u], prior[u]).mean()
+                prior_loss += kl_loss(prior[u], series[u]).mean()
 
-                series_kl = torch.mean(
-                    kl_loss(series[u], (prior[u] / norm_prior).detach())
-                )
-                prior_kl = torch.mean(
-                    kl_loss((prior[u] / norm_prior).detach(), series[u])
-                )
-                series_loss += series_kl + prior_kl
-                prior_loss += torch.mean(
-                    kl_loss((prior[u] / norm_prior), series[u].detach())
-                ) + torch.mean(kl_loss(series[u].detach(), (prior[u] / norm_prior)))
-            series_loss = series_loss / len(prior)
-            prior_loss = prior_loss / len(prior)
-            rec_loss = self.criterion(output, input)
-            loss_1.append((rec_loss - self.k * series_loss).item())
-            loss_2.append((rec_loss + self.k * prior_loss).item())
-        vali_loss1 = np.average(loss_1) if loss_1 else float("nan")
-        vali_loss2 = np.average(loss_2) if loss_2 else float("nan")
+            series_loss /= len(prior)
+            prior_loss /= len(prior)
 
-        return vali_loss1, vali_loss2
+            loss = (rec_loss + self.k * prior_loss + smoothness_loss +
+                    beta_prior_loss + tau_smoothness_loss)
+
+            losses.append(loss.item())
+        #     for u in range(len(prior)):
+        #         norm_prior = torch.unsqueeze(
+        #             torch.sum(prior[u], dim=-1), dim=-1
+        #         ).repeat(1, 1, 1, self.win_size)
+
+        #         series_kl = torch.mean(
+        #             kl_loss(series[u], (prior[u] / norm_prior).detach())
+        #         )
+        #         prior_kl = torch.mean(
+        #             kl_loss((prior[u] / norm_prior).detach(), series[u])
+        #         )
+        #         series_loss += series_kl + prior_kl
+        #         prior_loss += torch.mean(
+        #             kl_loss((prior[u] / norm_prior), series[u].detach())
+        #         ) + torch.mean(kl_loss(series[u].detach(), (prior[u] / norm_prior)))
+        #     series_loss = series_loss / len(prior)
+        #     prior_loss = prior_loss / len(prior)
+        #     rec_loss = self.criterion(output, input)
+        #     loss_1.append((rec_loss - self.k * series_loss).item())
+        #     loss_2.append((rec_loss + self.k * prior_loss).item())
+        # vali_loss1 = np.average(loss_1) if loss_1 else float("nan")
+        # vali_loss2 = np.average(loss_2) if loss_2 else float("nan")
+
+        # return vali_loss1, vali_loss2
+        return np.mean(losses), np.mean(losses)
 
     def train(self):
         logger.info("--------------- Train mode ---------------")
@@ -178,6 +200,12 @@ class AnomalyDetection:
             patience=3, verbose=True, dataset_name=self.dataset
         )
         train_steps = len(self.train_loader)
+        
+        # Use validation loader correctly
+        vali_loader = self.vali_loader
+
+        # Scale distillation explicitly
+        lamb_distill = self.training_config.get("lambda_smooth", 0.01)
 
         hurst_path = os.path.join(
             self.model_save_path, f"{self.dataset}_global_hurst.pt"
@@ -205,7 +233,8 @@ class AnomalyDetection:
         # Training loop
         for epoch in range(self.n_epochs):
             iter_count = 1
-            loss1_list = []
+            # loss1_list = []
+            epoch_losses = []
             self.model.train()
             epoch_time = time.time()
             for i, (input_data, labels) in enumerate(self.train_loader):
@@ -217,49 +246,66 @@ class AnomalyDetection:
                     prior,
                     _,
                     hurst,
-                    tau,
+                    # tau,
+                    _,
                     smoothness_loss,
                     beta_prior_loss,
                     tau_smoothness_loss,
                 ) = self.model(input)
+                # Reconstruction loss
+                rec_loss = self.criterion(output, input)
                 series_loss = 0.0
                 prior_loss = 0.0
+                # Ensuring stable KL computation. No renormalization
                 for u in range(len(prior)):
-                    norm_prior = torch.unsqueeze(
-                        torch.sum(prior[u], dim=-1), dim=-1
-                    ).repeat(1, 1, 1, self.win_size)
-                    series_kl = torch.mean(
-                        kl_loss(series[u], (prior[u] / norm_prior).detach())
-                    )
-                    prior_kl = torch.mean(
-                        kl_loss((prior[u] / norm_prior).detach(), series[u])
-                    )
-                    series_loss += series_kl + prior_kl
-                    prior_loss += torch.mean(
-                        kl_loss((prior[u] / norm_prior), series[u].detach())
-                    ) + torch.mean(kl_loss(series[u].detach(), (prior[u] / norm_prior)))
-                series_loss = series_loss / len(prior)
-                prior_loss = prior_loss / len(prior)
-                rec_loss = self.criterion(output, input)
-                distillation_loss = self.compute_distillation_loss(hurst)
+                    series_loss += kl_loss(series[u], prior[u].detach()).mean()
+                    prior_loss += kl_loss(prior[u], series[u].detach()).mean()
 
-                loss1_list.append((rec_loss - self.k * series_loss).item())
-                loss1 = (
-                    rec_loss
-                    - self.k * series_loss
-                    + smoothness_loss
-                    + beta_prior_loss
-                    + tau_smoothness_loss
-                    + distillation_loss
-                )
-                loss2 = (
-                    rec_loss
-                    + self.k * prior_loss
-                    + smoothness_loss
-                    + beta_prior_loss
-                    + tau_smoothness_loss
-                    + distillation_loss
-                )
+                series_loss /= len(prior)
+                prior_loss /= len(prior)
+
+                # Scaled distillation
+                distill_loss = lamb_distill * self.compute_distillation_loss(hurst)
+
+                # Single objective loss
+                loss = (rec_loss + self.k * (prior_loss - series_loss) + 
+                        smoothness_loss + beta_prior_loss + tau_smoothness_loss + distill_loss)
+                # for u in range(len(prior)):
+                #     norm_prior = torch.unsqueeze(
+                #         torch.sum(prior[u], dim=-1), dim=-1
+                #     ).repeat(1, 1, 1, self.win_size)
+                #     series_kl = torch.mean(
+                #         kl_loss(series[u], (prior[u] / norm_prior).detach())
+                #     )
+                #     prior_kl = torch.mean(
+                #         kl_loss((prior[u] / norm_prior).detach(), series[u])
+                #     )
+                #     series_loss += series_kl + prior_kl
+                #     prior_loss += torch.mean(
+                #         kl_loss((prior[u] / norm_prior), series[u].detach())
+                #     ) + torch.mean(kl_loss(series[u].detach(), (prior[u] / norm_prior)))
+                # series_loss = series_loss / len(prior)
+                # prior_loss = prior_loss / len(prior)
+                # rec_loss = self.criterion(output, input)
+                # distillation_loss = self.compute_distillation_loss(hurst)
+
+                # loss1_list.append((rec_loss - self.k * series_loss).item())
+                # loss1 = (
+                #     rec_loss
+                #     - self.k * series_loss
+                #     + smoothness_loss
+                #     + beta_prior_loss
+                #     + tau_smoothness_loss
+                #     + distillation_loss
+                # )
+                # loss2 = (
+                #     rec_loss
+                #     + self.k * prior_loss
+                #     + smoothness_loss
+                #     + beta_prior_loss
+                #     + tau_smoothness_loss
+                #     + distillation_loss
+                # )
 
                 if (i + 1) % 100 == 0:
                     speed = (time.time() - time_now) / iter_count
@@ -272,20 +318,36 @@ class AnomalyDetection:
                     iter_count = 1
                     time_now = time.time()
 
+                # One loss now
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                loss1.backward(retain_graph=True)
-                loss2.backward()
+                # loss1.backward(retain_graph=True)
+                # loss2.backward()
                 self.optimiser.step()
 
+                epoch_losses.append(loss.item())
+
+            # Get validation loss
+            val_loss = self.validation(vali_loader)[0]
+
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
-            train_loss = np.average(loss1_list) if loss1_list else float("nan")
-            vali_loss1, vali_loss2 = self.validation(self.test_loader)
+            train_loss = np.average(epoch_losses) if epoch_losses else float("nan")
+            # train_loss = np.average(loss1_list) if loss1_list else float("nan")
+            # vali_loss1, vali_loss2 = self.validation(self.test_loader)
+            # Validator should use vali_loader
+            # vali_loss1, vali_loss2 = self.validation(self.vali_loader)
+            # print(
+            #     "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
+            #         epoch + 1, train_steps, train_loss, vali_loss1
+            #     )
+            # )
             print(
                 "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
-                    epoch + 1, train_steps, train_loss, vali_loss1
+                    epoch + 1, train_steps, train_loss, val_loss
                 )
             )
-            early_stopping(vali_loss1, vali_loss2, self.model, path)
+            # early_stopping(vali_loss1, vali_loss2, self.model, path)
+            early_stopping(val_loss, val_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
