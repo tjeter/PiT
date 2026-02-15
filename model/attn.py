@@ -42,7 +42,9 @@ class PhaseSyncAttention(nn.Module):
         self.lambda_smooth = lambda_smooth
 
         indices = torch.arange(win_size, device=self.device)
-        self.distances = torch.abs(indices.unsqueeze(1) - indices.unsqueeze(0))
+
+        ''' This value is never used ''' # Not a bug, just wasteful
+        # self.distances = torch.abs(indices.unsqueeze(1) - indices.unsqueeze(0))
 
     def compute_fractal_abscissa(self, hurst):
         hurst = torch.clamp(hurst, min=0.01, max=1.0)
@@ -135,8 +137,21 @@ class PhaseSyncAttention(nn.Module):
         psi = self.compute_fractal_abscissa(hurst)
         prior = self.compute_gaussian_prior(psi)
 
-        x_flat = q.permute(0, 2, 1, 3).reshape(B, L, -1).detach()
-        gate = self.compute_phase_gate(x_flat, tau)
+        # Hopeful bug fix
+        x_flat = q.permute(0, 2, 1, 3).reshape(B, L, -1)
+        gate = self.compute_phase_gate(x_flat, tau.detach())
+
+        '''Above phase structure shapes attention behavior.
+           Tau remains stable and experiences no feedback explosion.
+           Encourages represation-prior alignment.
+
+           Below the phase gate depends on a signal.
+           Detaching means phase synchrony does not influence representation learning and only tau adapts.
+           This is contradicting to "attention should respect phase structure".
+           This version allows the model to violate phase synchrony with no penalty.
+        '''
+        # x_flat = q.permute(0, 2, 1, 3).reshape(B, L, -1).detach()
+        # gate = self.compute_phase_gate(x_flat, tau)
         prior = prior * gate
         prior = prior / (prior.sum(dim=-1, keepdim=True) + 1e-6)
 
@@ -146,7 +161,22 @@ class PhaseSyncAttention(nn.Module):
         beta_prior_loss = self.compute_beta_prior_loss(hurst)
 
         series = self.dropout(torch.softmax(attn, dim=-1))
-        V = torch.einsum("bhls,bshd->blhd", series, v)
+        # V = torch.einsum("bhls,bshd->blhd", series, v)
+        ''' Above the prior never influences value aggregation.
+            Prior is only used for KL loss. Attention output ignores physical structure.
+            The model can learn pathological attentions and get rid of them.
+            This weakens physical inductive bias and robustness to distribution shift.
+
+            Below the prior minimally regularizes the attention behavior.
+            It doesn't dominate data-driven learning.
+            Stability and interpretability should be improved.
+            KL-loss is still valid for anomaly scoring.
+            The prior is moved from a judge view to a soft guide view.
+        '''
+        # Hopeful bug fix
+        alpha = 0.1 # small for now, can be tuned
+        attn_combined = (1 - alpha) * series + alpha * prior
+        V = torch.einsum("bhls,bshd->blhd", attn_combined, v)
 
         if self.output_attention:
             return (
@@ -192,9 +222,23 @@ class AttentionLayer(nn.Module):
             self.hurst_projection,
             self.tau_projection,
         ]:
-            nn.init.xavier_uniform_(self.out_projection.weight)
-            if self.out_projection.bias is not None:
-                nn.init.zeros_(self.out_projection.bias)
+            # Hopeful bug fix
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeroes_(m.bias)
+            ''' Above, each linear projection is initalized independently.
+                Xavier is still used as outputs feed dot products (attention) and prior parameters are lated stabilized (sigmoid).
+                Unintended coupling between unrelated layers is removed.
+            
+                Below iterates over m but never initializes m.weight.
+                Reinitializes out_projection over and over.
+                Each projection layer uses the PyTorch default init, out_projection is reset repeatedly, and priors are poorly conditioned early on in training.
+                This bug directly affects prior smoothness, KL stability, and training convergence.
+            '''
+            # nn.init.xavier_uniform_(self.out_projection.weight)
+            # if self.out_projection.bias is not None:
+            #     nn.init.zeros_(self.out_projection.bias)
 
     def forward(self, q, k, v, attn_mask):
         B, L, _ = q.shape
