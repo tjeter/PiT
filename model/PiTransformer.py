@@ -19,6 +19,11 @@ class Encoder(nn.Module):
         sigma_list = []
         tau_list = []
 
+        # Adding lists to accumulate regularization losses per layer
+        smoothness_losses = []
+        beta_prior_losses = []
+        tau_smoothness_losses = []
+
         for i, attn_layer in enumerate(self.attn_layers):
             (
                 x,
@@ -27,6 +32,12 @@ class Encoder(nn.Module):
                 sigma,
                 hurst,
                 tau,
+                ''' Losses are overwritten at every layer.
+                    Only the last encoder layer contributes (incorrect).
+                    Plus, this contradicts "priors should be smooth at all abstraction levels".
+                    With this setup, lower layers can develop unstable priors.
+                    Higher layer regularization hides the problem, but can degrade interpretability in the long run.
+                '''
                 smoothness_loss,
                 beta_prior_loss,
                 tau_smoothness_loss,
@@ -37,6 +48,11 @@ class Encoder(nn.Module):
             sigma_list.append(sigma)
             tau_list.append(tau)
 
+            # Collecting regularization losses instead of overwriting them
+            smoothness_losses.append(smoothness_loss)
+            beta_prior_losses.append(beta_prior_loss)
+            tau_smoothness_losses.append(tau_smoothness_loss)
+
             if self.conv_layers is not None and i < len(self.conv_layers):
                 x = x.permute(0, 2, 1)  # [B, D, L]
                 x = self.conv_layers[i](x)  # [B, D, L]
@@ -46,6 +62,11 @@ class Encoder(nn.Module):
 
         hurst_agg = torch.mean(torch.stack(hurst_list), dim=0)  # [B, L, H]
         tau_agg = torch.mean(torch.stack(tau_list), dim=0)  # [B, L, H]
+
+        # Aggregating losses across layers correctly instead of overwriting
+        smoothness_loss = torch.stack(smoothness_losses).mean()
+        beta_prior_loss = torch.stack(beta_prior_losses).mean()
+        tau_smoothness_loss = torch.stack(tau_smoothness_losses).mean()
 
         return (
             x,
