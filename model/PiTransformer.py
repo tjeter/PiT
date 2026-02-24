@@ -97,6 +97,7 @@ class PiTransformer(nn.Module):
         gamma=2.0,
         sigma=1.0,
         lambda_smooth=0.01,
+        use_kan=False
     ):
         super(PiTransformer, self).__init__()
         self.win_size = win_size
@@ -120,6 +121,7 @@ class PiTransformer(nn.Module):
                 ),
                 d_model,
                 n_heads,
+                use_kan=use_kan
             )
             for _ in range(e_layers - 1)
         ]
