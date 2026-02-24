@@ -192,9 +192,109 @@ class PhaseSyncAttention(nn.Module):
         else:
             return (V.contiguous(), None)
 
+# From the original PyKan code: https://github.com/KindXiaoming/pykan/
+def B_batch(x, grid, k=0, extend=True, device='cpu'):
+    '''
+    evaludate x on B-spline bases
+    
+    Args:
+    -----
+        x : 2D torch.tensor
+            inputs, shape (number of splines, number of samples)
+        grid : 2D torch.tensor
+            grids, shape (number of splines, number of grid points)
+        k : int
+            the piecewise polynomial order of splines.
+        extend : bool
+            If True, k points are extended on both ends. If False, no extension (zero boundary condition). Default: True
+        device : str
+            devicde
+    
+    Returns:
+    --------
+        spline values : 3D torch.tensor
+            shape (batch, in_dim, G+k). G: the number of grid intervals, k: spline order.
+      
+    Example
+    -------
+    >>> from kan.spline import B_batch
+    >>> x = torch.rand(100,2)
+    >>> grid = torch.linspace(-1,1,steps=11)[None, :].expand(2, 11)
+    >>> B_batch(x, grid, k=3).shape
+    '''
+    
+    x = x.unsqueeze(dim=2)
+    grid = grid.unsqueeze(dim=0)
+    
+    if k == 0:
+        value = (x >= grid[:, :, :-1]) * (x < grid[:, :, 1:])
+    else:
+        B_km1 = B_batch(x[:,:,0], grid=grid[0], k=k - 1)
+        
+        value = (x - grid[:, :, :-(k + 1)]) / (grid[:, :, k:-1] - grid[:, :, :-(k + 1)]) * B_km1[:, :, :-1] + (
+                    grid[:, :, k + 1:] - x) / (grid[:, :, k + 1:] - grid[:, :, 1:(-k)]) * B_km1[:, :, 1:]
+    
+    # in case grid is degenerate
+    value = torch.nan_to_num(value)
+    return value
+
+def coef2curve(x_eval, grid, coef, k, device="cpu"):
+    '''
+    converting B-spline coefficients to B-spline curves. Evaluate x on B-spline curves (summing up B_batch results over B-spline basis).
+    
+    Args:
+    -----
+        x_eval : 2D torch.tensor
+            shape (batch, in_dim)
+        grid : 2D torch.tensor
+            shape (in_dim, G+2k). G: the number of grid intervals; k: spline order.
+        coef : 3D torch.tensor
+            shape (in_dim, out_dim, G+k)
+        k : int
+            the piecewise polynomial order of splines.
+        device : str
+            devicde
+        
+    Returns:
+    --------
+        y_eval : 3D torch.tensor
+            shape (batch, in_dim, out_dim)
+        
+    '''
+    
+    b_splines = B_batch(x_eval, grid, k=k)
+    y_eval = torch.einsum('ijk,jlk->ijl', b_splines, coef.to(b_splines.device))
+    
+    return y_eval
+
+class KANLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, num_knots=16, spline_order=1, grid_range(-3.0, 3.0)):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.k = spline_order
+
+        grid = torch.linspace(grid_range[0], grid_range[1], num_knots + 1)[None, :].expand(in_dim, -1)
+        self.register_buffer("grid", grid)
+
+        num_basis = grid.shape[-1] - 3 + spline_order
+        self.coef = nn.Parameter(torch.randn(in_dim, out_dim, num_basis) * 0.01)
+
+    def forward(self, x):
+        ''' x: [B, L, in_dim]
+            returns: [B, L, out_dim]
+        '''
+        B, L, D = x.shape
+        x = x.reshape(B * L, D)
+
+        y = coef2curve(x_eval=x, grid=self.grid, coef=self.coef, k=self.k)
+        y = y.sum(dim=1)
+        y = y.reshape(B, L, -1)
+
+        return y
 
 class AttentionLayer(nn.Module):
-    def __init__(self, attention, d_model, n_heads, d_k=None, d_v=None):
+    def __init__(self, attention, d_model, n_heads, d_k=None, d_v=None, use_kan=False):
         super(AttentionLayer, self).__init__()
         self.n_heads = n_heads
         d_k = d_k or (d_model // n_heads)
@@ -208,8 +308,14 @@ class AttentionLayer(nn.Module):
         self.v_projection = nn.Linear(d_model, d_model)
 
         self.sigma_projection = nn.Linear(d_model, n_heads)
-        self.hurst_projection = nn.Linear(d_model, n_heads)
-        self.tau_projection = nn.Linear(d_model, n_heads)
+        if use_kan:
+            print("Using KANLayer")
+            self.hurst_projection = KANLayer(d_model, n_heads)
+            self.tau_projection = KANLayer(d_model, n_heads)
+        else:
+            print("Using Linear layer")
+            self.hurst_projection = nn.Linear(d_model, n_heads)
+            self.tau_projection = nn.Linear(d_model, n_heads)
 
         self.out_projection = nn.Linear(d_v * n_heads, d_model)
 
