@@ -22,10 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 class AnomalyDetection:
-    def __init__(self, config_path, dataset):
+    def __init__(self, config_path, dataset, use_kan=False):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
+        self.use_kan = use_kan
         self.dataset = dataset
         self.data_dir = self.config["general"]["data_dir"]
         self.device = self.config["general"]["device"]
@@ -102,7 +103,8 @@ class AnomalyDetection:
             sigma=self.sigma,
             lambda_smooth=self.lambda_smooth,
             d_model=self.d_model,
-            n_heads =self.n_heads
+            n_heads =self.n_heads,
+            use_kan = self.use_kan
         )
 
         ''' Fixed this initialization inside the model so no need to overwrite.
@@ -589,11 +591,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--dataset", type=str, default="SMAP")
     parser.add_argument("--mode", type=str, default="train")
+    parser.add_argument("--use_kan", action="store_true", help="Use KAN instead of Linear for tau / hurst projections")
     args = parser.parse_args()
 
     cudnn.benchmark = True
     set_seed()
-    detector = AnomalyDetection(config_path="config.yaml", dataset=args.dataset)
+    detector = AnomalyDetection(config_path="config.yaml", dataset=args.dataset, use_kan=args.use_kan)
     if args.mode == "train":
         detector.train()
     elif args.mode == "test":
